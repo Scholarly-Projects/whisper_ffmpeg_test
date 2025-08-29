@@ -5,9 +5,11 @@ import tempfile
 import logging
 from pathlib import Path
 import numpy as np
-from pyannote.audio import Pipeline
-from pyannote.audio.pipelines.utils import get_device
-import whisper_cpp
+import whisper
+import torchaudio
+import time
+import torch
+import torchaudio.transforms as T
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -16,8 +18,8 @@ logger = logging.getLogger(__name__)
 # Configuration
 INPUT_DIR = "A"
 OUTPUT_DIR = "B"
-MODEL_PATH = "base.en.bin"  # Download this from whisper.cpp models
-SAMPLE_RATE = 16000  # Required by whisper.cpp
+MODEL_NAME = "small.en"  # Using standard Whisper model
+SAMPLE_RATE = 16000  # Required by Whisper
 
 def ensure_dir(directory):
     """Ensure directory exists."""
@@ -40,18 +42,18 @@ def convert_to_wav(input_path, output_path):
         logger.error(f"Error converting {input_path}: {e.stderr.decode('utf-8')}")
         return False
 
-def transcribe_with_whisper(audio_path, model_path):
-    """Transcribe audio using whisper.cpp with word-level timestamps."""
+def transcribe_with_whisper(audio_path, model_name):
+    """Transcribe audio using Whisper with word-level timestamps."""
     try:
-        # Load whisper.cpp model
-        model = whisper_cpp.Whisper(model_path)
+        # Load Whisper model
+        model = whisper.load_model(model_name)
         
         # Transcribe with word-level timestamps
         result = model.transcribe(
             audio_path,
             language="en",
             word_timestamps=True,
-            print_progress=False
+            verbose=False
         )
         
         # Extract word segments
@@ -69,35 +71,131 @@ def transcribe_with_whisper(audio_path, model_path):
         logger.error(f"Error transcribing {audio_path}: {str(e)}")
         return []
 
-def diarize_audio(audio_path):
-    """Perform speaker diarization using pyannote.audio."""
+def simple_speaker_diarization(word_segments, max_pause=2.0):
+    """
+    Simple speaker diarization based on pauses and context.
+    This is a heuristic approach that alternates speakers when there's a significant pause.
+    """
+    if not word_segments:
+        return []
+    
+    # Initialize with Speaker 1
+    current_speaker = "Speaker 1"
+    diarized_segments = []
+    
+    # Add first segment
+    first_segment = word_segments[0].copy()
+    first_segment['speaker'] = current_speaker
+    diarized_segments.append(first_segment)
+    
+    for i in range(1, len(word_segments)):
+        word = word_segments[i]
+        prev_word = word_segments[i-1]
+        
+        # Calculate pause between words
+        pause = word['start'] - prev_word['end']
+        
+        # If pause is significant, switch speaker
+        if pause > max_pause:
+            current_speaker = "Speaker 2" if current_speaker == "Speaker 1" else "Speaker 1"
+        
+        # Add word with current speaker
+        word_with_speaker = word.copy()
+        word_with_speaker['speaker'] = current_speaker
+        diarized_segments.append(word_with_speaker)
+    
+    return diarized_segments
+
+def diarize_audio_stereo(audio_path):
+    """Perform speaker diarization using stereo channel information."""
     try:
-        # Initialize diarization pipeline
-        pipeline = Pipeline.from_pretrained(
-            "pyannote/speaker-diarization-3.1",
-            use_auth_token=False  # Set to True if you have Hugging Face token
-        )
+        # Load audio
+        waveform, sample_rate = torchaudio.load(audio_path)
         
-        # Send pipeline to appropriate device
-        device = get_device()
-        pipeline.to(device)
+        # Check if stereo
+        if waveform.shape[0] < 2:
+            logger.warning("Audio is not stereo, using only pause-based diarization")
+            return None
         
-        # Process audio file
-        diarization = pipeline(audio_path)
+        # Resample if necessary
+        if sample_rate != SAMPLE_RATE:
+            resampler = T.Resample(sample_rate, SAMPLE_RATE)
+            waveform = resampler(waveform)
         
-        # Extract speaker segments
+        # Split into left and right channels
+        left_channel = waveform[0:1, :]
+        right_channel = waveform[1:2, :]
+        
+        # Simple energy-based voice activity detection
+        def detect_voice_activity(channel):
+            # Compute energy
+            energy = torch.abs(channel)
+            
+            # Smooth energy
+            window_size = int(0.1 * SAMPLE_RATE)  # 100ms window
+            if energy.shape[1] < window_size:
+                return torch.zeros_like(energy).bool()
+            
+            # Compute moving average
+            kernel = torch.ones(1, 1, window_size) / window_size
+            energy = energy.unsqueeze(0).unsqueeze(0)
+            smoothed_energy = torch.nn.functional.conv1d(energy, kernel, padding=window_size//2)
+            smoothed_energy = smoothed_energy.squeeze()
+            
+            # Threshold (adjust as needed)
+            threshold = smoothed_energy.mean() + 0.5 * smoothed_energy.std()
+            
+            return smoothed_energy > threshold
+        
+        # Detect voice activity on each channel
+        left_activity = detect_voice_activity(left_channel)
+        right_activity = detect_voice_activity(right_channel)
+        
+        # Create speaker segments
         speaker_segments = []
-        for turn, _, speaker in diarization.itertracks(yield_label=True):
-            speaker_segments.append({
-                'start': turn.start,
-                'end': turn.end,
-                'speaker': speaker
-            })
+        
+        # Simple approach: assume left channel is speaker 1, right is speaker 2
+        # This is a heuristic and may not always be accurate
+        
+        # Find segments where left channel is active and right is not
+        left_only = left_activity & ~right_activity
+        # Find segments where right channel is active and left is not
+        right_only = right_activity & ~left_activity
+        # Find segments where both are active (overlap)
+        both_active = left_activity & right_activity
+        
+        # Convert boolean arrays to segments
+        def bool_to_segments(bool_array, speaker):
+            segments = []
+            start = None
+            for i, active in enumerate(bool_array):
+                if active and start is None:
+                    start = i / SAMPLE_RATE
+                elif not active and start is not None:
+                    end = i / SAMPLE_RATE
+                    segments.append({
+                        'start': start,
+                        'end': end,
+                        'speaker': speaker
+                    })
+                    start = None
+            return segments
+        
+        # Get segments for each case
+        left_segments = bool_to_segments(left_only, "Speaker 1")
+        right_segments = bool_to_segments(right_only, "Speaker 2")
+        both_segments = bool_to_segments(both_active, "Speaker 1")  # Default to speaker 1 for overlaps
+        
+        # Combine all segments
+        speaker_segments = left_segments + right_segments + both_segments
+        
+        # Sort by start time
+        speaker_segments.sort(key=lambda x: x['start'])
         
         return speaker_segments
     except Exception as e:
-        logger.error(f"Error in diarization: {str(e)}")
-        return []
+        logger.error(f"Error in stereo diarization: {str(e)}")
+        return None
 
 def assign_speakers_to_words(word_segments, speaker_segments):
     """Assign speakers to word segments based on overlap."""
@@ -109,35 +207,24 @@ def assign_speakers_to_words(word_segments, speaker_segments):
         
         # Find speaker segment with maximum overlap
         max_overlap = 0
-        assigned_speaker = "Unknown"
+        assigned_speaker = "Speaker 1"  # Default
         
-        for segment in speaker_segments:
-            seg_start = segment['start']
-            seg_end = segment['end']
-            
-            # Calculate overlap
-            overlap_start = max(word_start, seg_start)
-            overlap_end = min(word_end, seg_end)
-            overlap = max(0, overlap_end - overlap_start)
-            
-            if overlap > max_overlap:
-                max_overlap = overlap
-                assigned_speaker = segment['speaker']
+        if speaker_segments:
+            for segment in speaker_segments:
+                seg_start = segment['start']
+                seg_end = segment['end']
+                
+                # Calculate overlap
+                overlap_start = max(word_start, seg_start)
+                overlap_end = min(word_end, seg_end)
+                overlap = max(0, overlap_end - overlap_start)
+                
+                if overlap > max_overlap:
+                    max_overlap = overlap
+                    assigned_speaker = segment['speaker']
         
-        # Convert speaker label to "Speaker 1", "Speaker 2", etc.
-        if assigned_speaker != "Unknown":
-            try:
-                speaker_num = int(assigned_speaker.split('_')[-1]) + 1
-                assigned_speaker = f"Speaker {speaker_num}"
-            except (ValueError, IndexError):
-                assigned_speaker = "Unknown"
-        
-        assigned_words.append({
-            'speaker': assigned_speaker,
-            'start': word_start,
-            'end': word_end,
-            'word': word['word']
-        })
+        word['speaker'] = assigned_speaker
+        assigned_words.append(word)
     
     return assigned_words
 
@@ -154,26 +241,22 @@ def process_file(input_path, output_csv_path):
         if not convert_to_wav(input_path, temp_wav_path):
             return False
         
-        # Transcribe with whisper.cpp
-        word_segments = transcribe_with_whisper(temp_wav_path, MODEL_PATH)
+        # Transcribe with Whisper
+        word_segments = transcribe_with_whisper(temp_wav_path, MODEL_NAME)
         if not word_segments:
             logger.warning(f"No words transcribed in {input_path}")
             return False
         
-        # Perform speaker diarization
-        speaker_segments = diarize_audio(temp_wav_path)
-        if not speaker_segments:
-            logger.warning(f"No speaker segments found in {input_path}")
-            # Assign all words to "Speaker 1" as fallback
-            assigned_words = [{
-                'speaker': 'Speaker 1',
-                'start': word['start'],
-                'end': word['end'],
-                'word': word['word']
-            } for word in word_segments]
-        else:
-            # Assign speakers to words
+        # Try stereo diarization first
+        speaker_segments = diarize_audio_stereo(temp_wav_path)
+        
+        if speaker_segments:
+            # Use stereo-based speaker assignment
             assigned_words = assign_speakers_to_words(word_segments, speaker_segments)
+        else:
+            # Fall back to pause-based diarization
+            logger.info("Using pause-based speaker diarization")
+            assigned_words = simple_speaker_diarization(word_segments)
         
         # Write to CSV
         with open(output_csv_path, 'w', newline='', encoding='utf-8') as csvfile:
@@ -189,7 +272,7 @@ def process_file(input_path, output_csv_path):
                     'words': word_data['word']
                 })
         
-        logger.info(f"Created CSV: {output_csv_path}")
+        logger.info(f"Created CSV: {output_path}")
         return True
     
     except Exception as e:
@@ -207,18 +290,11 @@ def main():
     ensure_dir(INPUT_DIR)
     ensure_dir(OUTPUT_DIR)
     
-    # Check if model exists
-    if not os.path.exists(MODEL_PATH):
-        logger.error(f"Model file not found: {MODEL_PATH}")
-        logger.error("Download models from: https://github.com/ggerganov/whisper.cpp/tree/master/models")
-        return
-    
-    # Supported file extensions
+    # Find input files
     audio_extensions = ['.wav', '.mp3', '.flac', '.aac', '.ogg', '.m4a']
     video_extensions = ['.mp4', '.mov', '.avi', '.mkv', '.webm']
     supported_extensions = audio_extensions + video_extensions
     
-    # Find input files
     input_files = []
     for ext in supported_extensions:
         input_files.extend(Path(INPUT_DIR).glob(f"*{ext}"))
@@ -228,6 +304,8 @@ def main():
         return
     
     logger.info(f"Found {len(input_files)} files to process")
+    logger.info(f"Using Whisper model: {MODEL_NAME}")
+    logger.info(f"Speaker diarization: Pause-based + Stereo Diarization")
     
     # Process each file
     success_count = 0
@@ -241,5 +319,4 @@ def main():
     logger.info(f"Total time: {time.time() - start_time:.2f} seconds")
 
 if __name__ == "__main__":
-    import time
     main()
