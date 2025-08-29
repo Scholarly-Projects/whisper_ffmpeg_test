@@ -20,6 +20,24 @@ INPUT_DIR = "A"
 OUTPUT_DIR = "B"
 MODEL_NAME = "small.en"  # Using standard Whisper model
 SAMPLE_RATE = 16000  # Required by Whisper
+MAX_PAUSE_WITHIN_SEGMENT = 1.0  # Maximum pause within a segment (in seconds)
+
+# Available Whisper models:
+# English-only models:
+# - tiny.en: ~39M parameters, fastest, least accurate
+# - base.en: ~74M parameters, good balance of speed and accuracy
+# - small.en: ~244M parameters, better accuracy
+# - medium.en: ~769M parameters, even better accuracy
+# 
+# Multilingual models (support multiple languages):
+# - tiny: ~39M parameters, supports 99 languages
+# - base: ~74M parameters, supports 99 languages
+# - small: ~244M parameters, supports 99 languages
+# - medium: ~769M parameters, supports 99 languages
+# - large: ~1550M parameters, supports 99 languages, most accurate
+# - large-v2: ~1550M parameters, improved version of large model
+# - large-v3: ~1550M parameters, latest version with improved accuracy
+# - turbo: ~809M parameters, optimized version of large-v3 with faster transcription
 
 def ensure_dir(directory):
     """Ensure directory exists."""
@@ -228,6 +246,64 @@ def assign_speakers_to_words(word_segments, speaker_segments):
     
     return assigned_words
 
+def format_time(seconds):
+    """Format time in seconds to HH:MM:SS:XX format for timestamp."""
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    hundredths = int((seconds - int(seconds)) * 100)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}:{hundredths:02d}"
+
+def format_end_time(seconds):
+    """Format time in seconds to [HH:MM:SS:XX] format for End Time."""
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    hundredths = int((seconds - int(seconds)) * 100)
+    return f"[{hours:02d}:{minutes:02d}:{secs:02d}:{hundredths:02d}]"
+
+def group_segments(word_segments, max_pause=MAX_PAUSE_WITHIN_SEGMENT):
+    """Group word segments by speaker and pause."""
+    if not word_segments:
+        return []
+    
+    segments = []
+    current_segment = {
+        'speaker': word_segments[0]['speaker'],
+        'start': word_segments[0]['start'],
+        'end': word_segments[0]['end'],
+        'words': [word_segments[0]['word']]
+    }
+    
+    for i in range(1, len(word_segments)):
+        word = word_segments[i]
+        prev_word = word_segments[i-1]
+        
+        # Check if we should start a new segment
+        pause = word['start'] - prev_word['end']
+        speaker_change = word['speaker'] != current_segment['speaker']
+        
+        if speaker_change or pause > max_pause:
+            # Save current segment
+            segments.append(current_segment)
+            
+            # Start new segment
+            current_segment = {
+                'speaker': word['speaker'],
+                'start': word['start'],
+                'end': word['end'],
+                'words': [word['word']]
+            }
+        else:
+            # Add to current segment
+            current_segment['end'] = word['end']
+            current_segment['words'].append(word['word'])
+    
+    # Add the last segment
+    segments.append(current_segment)
+    
+    return segments
+
 def process_file(input_path, output_csv_path):
     """Process a single audio/video file."""
     logger.info(f"Processing {input_path}")
@@ -258,18 +334,24 @@ def process_file(input_path, output_csv_path):
             logger.info("Using pause-based speaker diarization")
             assigned_words = simple_speaker_diarization(word_segments)
         
+        # Group words into segments
+        segments = group_segments(assigned_words)
+        
         # Write to CSV
         with open(output_csv_path, 'w', newline='', encoding='utf-8') as csvfile:
-            fieldnames = ['speaker', 'time start', 'time stop', 'words']
+            fieldnames = ['speaker', 'timestamp', 'End Time', 'words']
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
             
-            for word_data in assigned_words:
+            for segment in segments:
+                # Join words with spaces
+                text = ' '.join(segment['words'])
+                
                 writer.writerow({
-                    'speaker': word_data['speaker'],
-                    'time start': f"{word_data['start']:.2f}",
-                    'time stop': f"{word_data['end']:.2f}",
-                    'words': word_data['word']
+                    'speaker': segment['speaker'],
+                    'timestamp': f"[{format_time(segment['start'])}]",
+                    'End Time': format_end_time(segment['end']),
+                    'words': text
                 })
         
         logger.info(f"Created CSV: {output_path}")
