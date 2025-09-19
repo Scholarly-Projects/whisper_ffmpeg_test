@@ -4,12 +4,14 @@ import subprocess
 import tempfile
 import logging
 from pathlib import Path
-import numpy as np
 import whisper
-import torchaudio
-import time
 import torch
+from speechbrain.inference.speaker import EncoderClassifier
+from sklearn.cluster import KMeans
+import numpy as np
+import torchaudio
 import torchaudio.transforms as T
+from collections import defaultdict
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -18,280 +20,80 @@ logger = logging.getLogger(__name__)
 # Configuration
 INPUT_DIR = "A"
 OUTPUT_DIR = "B"
-MODEL_NAME = "small.en"  # Using standard Whisper model
-SAMPLE_RATE = 16000  # Required by Whisper
+MODEL_NAME = "small.en"
+SAMPLE_RATE = 16000
+MAX_SPEAKERS = 4
+
+# Initialize models
+logger.info("Loading models...")
+whisper_model = whisper.load_model(MODEL_NAME)
+speaker_encoder = EncoderClassifier.from_hparams(
+    source="speechbrain/spkrec-xvect-voxceleb",
+    savedir="pretrained_models/spkrec-xvect-voxceleb",
+    run_opts={"device": "cuda"} if torch.cuda.is_available() else {"device": "cpu"}
+)
+
 
 def ensure_dir(directory):
-    """Ensure directory exists."""
     Path(directory).mkdir(parents=True, exist_ok=True)
 
+
 def convert_to_wav(input_path, output_path):
-    """Convert audio/video file to WAV format using ffmpeg."""
-    cmd = [
-        "ffmpeg",
-        "-i", input_path,
-        "-ar", str(SAMPLE_RATE),
-        "-ac", "1",  # Mono
-        "-y",  # Overwrite output file
-        output_path
-    ]
+    cmd = ["ffmpeg", "-i", input_path, "-ar", str(SAMPLE_RATE), "-ac", "1", "-y", output_path]
     try:
         subprocess.run(cmd, check=True, capture_output=True)
         return True
     except subprocess.CalledProcessError as e:
-        logger.error(f"Error converting {input_path}: {e.stderr.decode('utf-8')}")
+        logger.error(f"Error converting {input_path}: {e}")
         return False
 
-def transcribe_with_whisper(audio_path, model_name):
-    """Transcribe audio using Whisper with word-level timestamps."""
-    try:
-        # Load Whisper model
-        model = whisper.load_model(model_name)
-        
-        # Transcribe with word-level timestamps
-        result = model.transcribe(
-            audio_path,
-            language="en",
-            word_timestamps=True,
-            verbose=False
-        )
-        
-        # Extract word segments
-        word_segments = []
-        for segment in result.get('segments', []):
-            for word in segment.get('words', []):
-                word_segments.append({
-                    'start': word.get('start', 0),
-                    'end': word.get('end', 0),
-                    'word': word.get('word', '').strip()
-                })
-        
-        return word_segments
-    except Exception as e:
-        logger.error(f"Error transcribing {audio_path}: {str(e)}")
-        return []
 
-def simple_speaker_diarization(word_segments):
-    """
-    Simple speaker diarization based on question-answer patterns.
-    """
-    if not word_segments:
-        return []
-    
-    current_speaker = "Speaker 1"  # Start with Speaker 1
-    diarized_segments = []
-    
-    # Add first segment
-    first_segment = word_segments[0].copy()
-    first_segment['speaker'] = current_speaker
-    diarized_segments.append(first_segment)
-    
-    for i in range(1, len(word_segments)):
-        word = word_segments[i]
-        prev_word = word_segments[i-1]
-        
-        # Calculate pause between words
-        pause = word['start'] - prev_word['end']
-        
-        # Check for question marks or typical question patterns
-        is_question = "?" in prev_word['word']
-        is_short_pause = pause > 0.3  # Short pause might indicate end of question
-        
-        # Switch speaker if a question is detected followed by a response
-        if is_question and is_short_pause:
-            current_speaker = "Speaker 2" if current_speaker == "Speaker 1" else "Speaker 1"
-        
-        # Add word with current speaker
-        word_with_speaker = word.copy()
-        word_with_speaker['speaker'] = current_speaker
-        diarized_segments.append(word_with_speaker)
-    
-    return diarized_segments
-
-def diarize_audio_stereo(audio_path):
-    """Perform speaker diarization using stereo channel information."""
+def extract_segment_embedding(audio_path, start_time, end_time):
+    """Extract speaker embedding for a specific time segment."""
     try:
-        # Load audio
-        waveform, sample_rate = torchaudio.load(audio_path)
-        
-        # Check if stereo
-        if waveform.shape[0] < 2:
-            logger.warning("Audio is not stereo, using only pause-based diarization")
-            return None
-        
-        # Resample if necessary
-        if sample_rate != SAMPLE_RATE:
-            resampler = T.Resample(sample_rate, SAMPLE_RATE)
+        waveform, sr = torchaudio.load(audio_path)
+        if sr != SAMPLE_RATE:
+            resampler = T.Resample(sr, SAMPLE_RATE)
             waveform = resampler(waveform)
         
-        # Split into left and right channels
-        left_channel = waveform[0:1, :]
-        right_channel = waveform[1:2, :]
+        start_sample = int(start_time * SAMPLE_RATE)
+        end_sample = int(end_time * SAMPLE_RATE)
         
-        # Simple energy-based voice activity detection
-        def detect_voice_activity(channel):
-            # Compute energy
-            energy = torch.abs(channel)
+        if end_sample > waveform.size(1):
+            end_sample = waveform.size(1)
+        if start_sample >= end_sample:
+            return None
             
-            # Smooth energy
-            window_size = int(0.1 * SAMPLE_RATE)  # 100ms window
-            if energy.shape[1] < window_size:
-                return torch.zeros_like(energy).bool()
-            
-            # Compute moving average
-            kernel = torch.ones(1, 1, window_size) / window_size
-            energy = energy.unsqueeze(0).unsqueeze(0)
-            smoothed_energy = torch.nn.functional.conv1d(energy, kernel, padding=window_size//2)
-            smoothed_energy = smoothed_energy.squeeze()
-            
-            # Threshold (adjust as needed)
-            threshold = smoothed_energy.mean() + 0.5 * smoothed_energy.std()
-            return smoothed_energy > threshold
+        segment_wave = waveform[:, start_sample:end_sample]
+        segment_wave = segment_wave / (segment_wave.abs().max() + 1e-8)
         
-        # Detect voice activity on each channel
-        left_activity = detect_voice_activity(left_channel)
-        right_activity = detect_voice_activity(right_channel)
-        
-        # Create speaker segments
-        speaker_segments = []
-        
-        # Simple approach: assume left channel is speaker 1, right is speaker 2
-        # This is a heuristic and may not always be accurate
-        
-        # Find segments where left channel is active and right is not
-        left_only = left_activity & ~right_activity
-        
-        # Find segments where right channel is active and left is not
-        right_only = right_activity & ~left_activity
-        
-        # Find segments where both are active (overlap)
-        both_active = left_activity & right_activity
-        
-        # Convert boolean arrays to segments
-        def bool_to_segments(bool_array, speaker):
-            segments = []
-            start = None
-            for i, active in enumerate(bool_array):
-                if active and start is None:
-                    start = i / SAMPLE_RATE
-                elif not active and start is not None:
-                    end = i / SAMPLE_RATE
-                    segments.append({
-                        'start': start,
-                        'end': end,
-                        'speaker': speaker
-                    })
-                    start = None
-            return segments
-        
-        # Get segments for each case
-        left_segments = bool_to_segments(left_only, "Speaker 1")
-        right_segments = bool_to_segments(right_only, "Speaker 2")
-        both_segments = bool_to_segments(both_active, "Speaker 1")  # Default to speaker 1 for overlaps
-        
-        # Combine all segments
-        speaker_segments = left_segments + right_segments + both_segments
-        
-        # Sort by start time
-        speaker_segments.sort(key=lambda x: x['start'])
-        
-        return speaker_segments
+        with torch.no_grad():
+            embedding = speaker_encoder.encode_batch(segment_wave)
+            return embedding.squeeze().cpu().numpy()
     except Exception as e:
-        logger.error(f"Error in stereo diarization: {str(e)}")
+        logger.warning(f"Failed to extract embedding for segment {start_time}-{end_time}: {e}")
         return None
 
-def assign_speakers_to_words(word_segments, speaker_segments):
-    """Assign speakers to word segments based on overlap."""
-    assigned_words = []
-    
-    for word in word_segments:
-        word_start = word['start']
-        word_end = word['end']
-        
-        # Find speaker segment with maximum overlap
-        max_overlap = 0
-        assigned_speaker = "Speaker 1"  # Default
-        
-        if speaker_segments:
-            for segment in speaker_segments:
-                seg_start = segment['start']
-                seg_end = segment['end']
-                
-                # Calculate overlap
-                overlap_start = max(word_start, seg_start)
-                overlap_end = min(word_end, seg_end)
-                overlap = max(0, overlap_end - overlap_start)
-                
-                if overlap > max_overlap:
-                    max_overlap = overlap
-                    assigned_speaker = segment['speaker']
-        
-        word['speaker'] = assigned_speaker
-        assigned_words.append(word)
-    
-    return assigned_words
 
 def format_time(seconds):
-    """Format time in seconds to HH:MM:SS:XX format for timestamp."""
     hours = int(seconds // 3600)
     minutes = int((seconds % 3600) // 60)
     secs = int(seconds % 60)
     hundredths = int((seconds - int(seconds)) * 100)
     return f"{hours:02d}:{minutes:02d}:{secs:02d}:{hundredths:02d}"
 
+
 def format_end_time(seconds):
-    """Format time in seconds to [HH:MM:SS:XX] format for End Time."""
     hours = int(seconds // 3600)
     minutes = int((seconds % 3600) // 60)
     secs = int(seconds % 60)
     hundredths = int((seconds - int(seconds)) * 100)
     return f"[{hours:02d}:{minutes:02d}:{secs:02d}:{hundredths:02d}]"
 
-def group_segments(word_segments):
-    """Group word segments by speaker."""
-    if not word_segments:
-        return []
-    
-    segments = []
-    current_segment = {
-        'speaker': word_segments[0]['speaker'],
-        'start': word_segments[0]['start'],
-        'end': word_segments[0]['end'],
-        'words': [word_segments[0]['word']]
-    }
-    
-    for i in range(1, len(word_segments)):
-        word = word_segments[i]
-        prev_word = word_segments[i-1]
-        
-        # Check if we should start a new segment
-        speaker_change = word['speaker'] != current_segment['speaker']
-        
-        if speaker_change:
-            # Save current segment
-            segments.append(current_segment)
-            # Start new segment
-            current_segment = {
-                'speaker': word['speaker'],
-                'start': word['start'],
-                'end': word['end'],
-                'words': [word['word']]
-            }
-        else:
-            # Add to current segment
-            current_segment['end'] = word['end']
-            current_segment['words'].append(word['word'])
-    
-    # Add the last segment
-    segments.append(current_segment)
-    
-    return segments
 
 def process_file(input_path, output_csv_path):
-    """Process a single audio/video file."""
     logger.info(f"Processing {input_path}")
     
-    # Create temporary WAV file
     with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_wav:
         temp_wav_path = temp_wav.name
     
@@ -300,24 +102,105 @@ def process_file(input_path, output_csv_path):
         if not convert_to_wav(input_path, temp_wav_path):
             return False
         
-        # Transcribe with Whisper
-        word_segments = transcribe_with_whisper(temp_wav_path, MODEL_NAME)
-        if not word_segments:
-            logger.warning(f"No words transcribed in {input_path}")
+        # Transcribe with Whisper (let it do the heavy lifting)
+        logger.info("Transcribing with Whisper...")
+        result = whisper_model.transcribe(
+            temp_wav_path,
+            language="en",
+            word_timestamps=True,
+            verbose=False
+        )
+        
+        # Extract segments from Whisper result
+        segments = result.get('segments', [])
+        if not segments:
+            logger.warning("No segments found in transcription")
             return False
         
-        # Try stereo diarization first
-        speaker_segments = diarize_audio_stereo(temp_wav_path)
-        if speaker_segments:
-            # Use stereo-based speaker assignment
-            assigned_words = assign_speakers_to_words(word_segments, speaker_segments)
-        else:
-            # Fall back to pause-based diarization
-            logger.info("Using question-based speaker diarization")
-            assigned_words = simple_speaker_diarization(word_segments)
+        # Extract embeddings for each segment
+        embeddings = []
+        valid_segments = []
         
-        # Group words into segments
-        segments = group_segments(assigned_words)
+        for segment in segments:
+            start_time = segment.get('start', 0)
+            end_time = segment.get('end', 0)
+            
+            # Only process segments longer than 1 second
+            if end_time - start_time < 1.0:
+                continue
+                
+            embedding = extract_segment_embedding(temp_wav_path, start_time, end_time)
+            if embedding is not None:
+                embeddings.append(embedding)
+                valid_segments.append(segment)
+        
+        if len(embeddings) == 0:
+            # Fallback: assign all to Speaker 1
+            logger.warning("No valid embeddings, assigning all to Speaker 1")
+            speaker_labels = [0] * len(segments)
+            segments_to_use = segments
+        else:
+            # Simple K-means clustering on embeddings
+            embeddings = np.array(embeddings)
+            n_clusters = min(MAX_SPEAKERS, len(embeddings))
+            
+            if n_clusters > 1:
+                kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+                cluster_labels = kmeans.fit_predict(embeddings)
+            else:
+                cluster_labels = [0] * len(embeddings)
+            segments_to_use = valid_segments
+        
+        # Map cluster labels to speaker names based on order of appearance
+        # First, create a mapping from cluster label to speaker number in order of appearance
+        speaker_counter = 1
+        cluster_to_speaker = {}
+        speaker_labels = []
+        
+        for i, label in enumerate(cluster_labels):
+            if label not in cluster_to_speaker:
+                cluster_to_speaker[label] = f"Speaker {speaker_counter}"
+                speaker_counter += 1
+            speaker_labels.append(cluster_to_speaker[label])
+        
+        # Assign speakers to segments and group consecutive segments from same speaker
+        temp_segments = []
+        for i, segment in enumerate(segments_to_use):
+            speaker = speaker_labels[i]
+            temp_segments.append({
+                'speaker': speaker,
+                'start': segment.get('start', 0),
+                'end': segment.get('end', 0),
+                'text': segment.get('text', '').strip()
+            })
+        
+        # Group consecutive segments from the same speaker
+        final_segments = []
+        if temp_segments:
+            current_segment = {
+                'speaker': temp_segments[0]['speaker'],
+                'start': temp_segments[0]['start'],
+                'end': temp_segments[0]['end'],
+                'text': temp_segments[0]['text']
+            }
+            
+            for segment in temp_segments[1:]:
+                # If same speaker, merge regardless of pause duration
+                if segment['speaker'] == current_segment['speaker']:
+                    current_segment['end'] = segment['end']
+                    current_segment['text'] += ' ' + segment['text']
+                else:
+                    # Different speaker, start new segment
+                    final_segments.append(current_segment)
+                    current_segment = {
+                        'speaker': segment['speaker'],
+                        'start': segment['start'],
+                        'end': segment['end'],
+                        'text': segment['text']
+                    }
+            
+            # Don't forget the last segment
+            final_segments.append(current_segment)
         
         # Write to CSV
         with open(output_csv_path, 'w', newline='', encoding='utf-8') as csvfile:
@@ -325,34 +208,30 @@ def process_file(input_path, output_csv_path):
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
             
-            for segment in segments:
-                # Join words with spaces
-                text = ' '.join(segment['words'])
+            for segment in final_segments:
                 writer.writerow({
                     'speaker': segment['speaker'],
                     'timestamp': f"[{format_time(segment['start'])}]",
                     'End Time': format_end_time(segment['end']),
-                    'words': text
+                    'words': segment['text']
                 })
         
         logger.info(f"Created CSV: {output_csv_path}")
         return True
+        
     except Exception as e:
         logger.error(f"Error processing {input_path}: {str(e)}")
         return False
     finally:
-        # Clean up temporary file
         if os.path.exists(temp_wav_path):
             os.unlink(temp_wav_path)
 
+
 def main():
-    start_time = time.time()
-    
-    # Ensure directories exist
     ensure_dir(INPUT_DIR)
     ensure_dir(OUTPUT_DIR)
     
-    # Find input files
+    # Find supported files
     audio_extensions = ['.wav', '.mp3', '.flac', '.aac', '.ogg', '.m4a']
     video_extensions = ['.mp4', '.mov', '.avi', '.mkv', '.webm']
     supported_extensions = audio_extensions + video_extensions
@@ -362,14 +241,11 @@ def main():
         input_files.extend(Path(INPUT_DIR).glob(f"*{ext}"))
     
     if not input_files:
-        logger.error(f"No supported audio/video files found in {INPUT_DIR}")
+        logger.error(f"No supported files found in {INPUT_DIR}")
         return
     
     logger.info(f"Found {len(input_files)} files to process")
-    logger.info(f"Using Whisper model: {MODEL_NAME}")
-    logger.info(f"Speaker diarization: Question-based + Stereo Diarization")
     
-    # Process each file
     success_count = 0
     for input_path in input_files:
         output_csv_path = Path(OUTPUT_DIR) / f"{input_path.stem}.csv"
@@ -377,8 +253,7 @@ def main():
             success_count += 1
     
     logger.info(f"Processed {success_count}/{len(input_files)} files successfully")
-    logger.info(f"Total time: {time.time() - start_time:.2f} seconds")
+
 
 if __name__ == "__main__":
     main()
-    
