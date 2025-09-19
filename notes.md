@@ -1,3 +1,3 @@
 # notes
 
-- Give speechbrain another try for diarization
+- Speaker diarization is just not there. While Whisper seems to have higher accuracy of transcription, Sensei has better diarization.
