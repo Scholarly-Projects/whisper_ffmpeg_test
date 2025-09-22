@@ -10,33 +10,33 @@ from speechbrain.inference.speaker import EncoderClassifier
 from sklearn.cluster import KMeans
 import numpy as np
 import torchaudio
-import torchaudio.transforms as T
 from collections import defaultdict
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
-# Configuration
+# === CONFIG ===
 INPUT_DIR = "A"
 OUTPUT_DIR = "B"
-MODEL_NAME = "small.en"
+MODEL_NAME = "small.en"  # Use "base.en" for faster, "medium.en" for more accurate
 SAMPLE_RATE = 16000
 MAX_SPEAKERS = 4
 
-# Initialize models
+# === LOGGING ===
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# === MODELS ===
 logger.info("Loading models...")
-whisper_model = whisper.load_model(MODEL_NAME)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+whisper_model = whisper.load_model(MODEL_NAME, device=device)
 speaker_encoder = EncoderClassifier.from_hparams(
     source="speechbrain/spkrec-xvect-voxceleb",
     savedir="pretrained_models/spkrec-xvect-voxceleb",
-    run_opts={"device": "cuda"} if torch.cuda.is_available() else {"device": "cpu"}
+    run_opts={"device": device}
 )
 
+# === HELPERS ===
 
 def ensure_dir(directory):
     Path(directory).mkdir(parents=True, exist_ok=True)
-
 
 def convert_to_wav(input_path, output_path):
     cmd = ["ffmpeg", "-i", input_path, "-ar", str(SAMPLE_RATE), "-ac", "1", "-y", output_path]
@@ -44,216 +44,199 @@ def convert_to_wav(input_path, output_path):
         subprocess.run(cmd, check=True, capture_output=True)
         return True
     except subprocess.CalledProcessError as e:
-        logger.error(f"Error converting {input_path}: {e}")
+        logger.error(f"FFmpeg failed on {input_path}: {e}")
         return False
 
-
-def extract_segment_embedding(audio_path, start_time, end_time):
-    """Extract speaker embedding for a specific time segment."""
+def extract_embedding(audio_path, start, end):
     try:
         waveform, sr = torchaudio.load(audio_path)
         if sr != SAMPLE_RATE:
-            resampler = T.Resample(sr, SAMPLE_RATE)
+            resampler = torchaudio.transforms.Resample(sr, SAMPLE_RATE)
             waveform = resampler(waveform)
-        
-        start_sample = int(start_time * SAMPLE_RATE)
-        end_sample = int(end_time * SAMPLE_RATE)
-        
-        if end_sample > waveform.size(1):
-            end_sample = waveform.size(1)
-        if start_sample >= end_sample:
-            return None
-            
-        segment_wave = waveform[:, start_sample:end_sample]
-        segment_wave = segment_wave / (segment_wave.abs().max() + 1e-8)
-        
+        start_samp = int(start * SAMPLE_RATE)
+        end_samp = int(end * SAMPLE_RATE)
+        if end_samp > waveform.size(1): end_samp = waveform.size(1)
+        if start_samp >= end_samp: return None
+        segment = waveform[:, start_samp:end_samp]
+        segment = segment / (segment.abs().max() + 1e-8)  # normalize
         with torch.no_grad():
-            embedding = speaker_encoder.encode_batch(segment_wave)
-            return embedding.squeeze().cpu().numpy()
+            emb = speaker_encoder.encode_batch(segment)
+            return emb.squeeze().cpu().numpy()
     except Exception as e:
-        logger.warning(f"Failed to extract embedding for segment {start_time}-{end_time}: {e}")
+        logger.warning(f"Embedding failed for [{start:.1f}-{end:.1f}s]: {e}")
         return None
 
+def is_sentence_end(text):
+    return text.strip().endswith(('.', '?', '!', '."', '?"', '!"'))
 
-def format_time(seconds):
-    hours = int(seconds // 3600)
-    minutes = int((seconds % 3600) // 60)
-    secs = int(seconds % 60)
-    hundredths = int((seconds - int(seconds)) * 100)
-    return f"{hours:02d}:{minutes:02d}:{secs:02d}:{hundredths:02d}"
+def format_timestamp(seconds, include_brackets=False):
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    ms = int((seconds - int(seconds)) * 100)
+    ts = f"{h:02d}:{m:02d}:{s:02d}:{ms:02d}"
+    return f"[{ts}]" if include_brackets else ts
 
-
-def format_end_time(seconds):
-    hours = int(seconds // 3600)
-    minutes = int((seconds % 3600) // 60)
-    secs = int(seconds % 60)
-    hundredths = int((seconds - int(seconds)) * 100)
-    return f"[{hours:02d}:{minutes:02d}:{secs:02d}:{hundredths:02d}]"
-
+# === MAIN PROCESSING ===
 
 def process_file(input_path, output_csv_path):
-    logger.info(f"Processing {input_path}")
+    logger.info(f"Processing: {input_path.name}")
     
-    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_wav:
-        temp_wav_path = temp_wav.name
-    
+    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
+        wav_path = tmp.name
+
     try:
-        # Convert to WAV
-        if not convert_to_wav(input_path, temp_wav_path):
+        if not convert_to_wav(str(input_path), wav_path):
             return False
-        
-        # Transcribe with Whisper (let it do the heavy lifting)
-        logger.info("Transcribing with Whisper...")
+
+        # Transcribe with word timestamps for segmentation
         result = whisper_model.transcribe(
-            temp_wav_path,
+            wav_path,
             language="en",
             word_timestamps=True,
             verbose=False
         )
-        
-        # Extract segments from Whisper result
+
         segments = result.get('segments', [])
         if not segments:
-            logger.warning("No segments found in transcription")
+            logger.warning("No segments transcribed.")
             return False
-        
-        # Extract embeddings for each segment
+
+        # Group into sentence-level segments (safe boundaries)
+        sentence_segments = []
+        current = {'start': None, 'text': '', 'words': []}
+
+        for segment in segments:
+            words = segment.get('words', [])
+            for word in words:
+                if current['start'] is None:
+                    current['start'] = word['start']
+                current['text'] += word['word']
+                current['words'].append(word)
+                if is_sentence_end(current['text']):
+                    current['end'] = word['end']
+                    sentence_segments.append(current.copy())
+                    current = {'start': None, 'text': '', 'words': []}
+            # Flush remaining if segment ends
+            if current['text'] and (not words or segment == segments[-1]):
+                current['end'] = segment['end']
+                sentence_segments.append(current)
+                current = {'start': None, 'text': '', 'words': []}
+
+        if not sentence_segments:
+            logger.warning("No sentence segments created. Using raw segments.")
+            sentence_segments = [
+                {'start': s['start'], 'end': s['end'], 'text': s['text']}
+                for s in segments
+            ]
+
+        # Extract embeddings (min 1.5s for stability)
         embeddings = []
         valid_segments = []
-        
-        for segment in segments:
-            start_time = segment.get('start', 0)
-            end_time = segment.get('end', 0)
-            
-            # Only process segments longer than 1 second
-            if end_time - start_time < 1.0:
+
+        for seg in sentence_segments:
+            dur = seg['end'] - seg['start']
+            if dur < 1.5:
                 continue
-                
-            embedding = extract_segment_embedding(temp_wav_path, start_time, end_time)
-            if embedding is not None:
-                embeddings.append(embedding)
-                valid_segments.append(segment)
-        
-        if len(embeddings) == 0:
-            # Fallback: assign all to Speaker 1
-            logger.warning("No valid embeddings, assigning all to Speaker 1")
-            speaker_labels = [0] * len(segments)
-            segments_to_use = segments
-        else:
-            # Simple K-means clustering on embeddings
-            embeddings = np.array(embeddings)
-            n_clusters = min(MAX_SPEAKERS, len(embeddings))
-            
-            if n_clusters > 1:
-                kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-                cluster_labels = kmeans.fit_predict(embeddings)
-            else:
-                cluster_labels = [0] * len(embeddings)
-            segments_to_use = valid_segments
-        
-        # Map cluster labels to speaker names based on order of appearance
-        # First, create a mapping from cluster label to speaker number in order of appearance
-        speaker_counter = 1
-        cluster_to_speaker = {}
+            emb = extract_embedding(wav_path, seg['start'], seg['end'])
+            if emb is not None:
+                embeddings.append(emb)
+                valid_segments.append(seg)
+
+        # Assign speakers
         speaker_labels = []
-        
-        for i, label in enumerate(cluster_labels):
-            if label not in cluster_to_speaker:
-                cluster_to_speaker[label] = f"Speaker {speaker_counter}"
-                speaker_counter += 1
-            speaker_labels.append(cluster_to_speaker[label])
-        
-        # Assign speakers to segments and group consecutive segments from same speaker
-        temp_segments = []
-        for i, segment in enumerate(segments_to_use):
-            speaker = speaker_labels[i]
-            temp_segments.append({
-                'speaker': speaker,
-                'start': segment.get('start', 0),
-                'end': segment.get('end', 0),
-                'text': segment.get('text', '').strip()
-            })
-        
-        # Group consecutive segments from the same speaker
-        final_segments = []
-        if temp_segments:
-            current_segment = {
-                'speaker': temp_segments[0]['speaker'],
-                'start': temp_segments[0]['start'],
-                'end': temp_segments[0]['end'],
-                'text': temp_segments[0]['text']
+        if len(embeddings) < 2:
+            # Not enough to cluster → assign all to Speaker 1
+            speaker_labels = ["Speaker 1"] * len(sentence_segments)
+        else:
+            # Cluster valid segments
+            n_clusters = min(MAX_SPEAKERS, len(embeddings))
+            kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+            cluster_ids = kmeans.fit_predict(np.array(embeddings))
+            cluster_to_speaker = {}
+            speaker_id = 1
+            for cid in cluster_ids:
+                if cid not in cluster_to_speaker:
+                    cluster_to_speaker[cid] = f"Speaker {speaker_id}"
+                    speaker_id += 1
+            # Map clustered segments
+            speaker_map = {}
+            for i, seg in enumerate(valid_segments):
+                speaker_map[(seg['start'], seg['end'])] = cluster_to_speaker[cluster_ids[i]]
+            # Assign labels to all segments (fallback to Speaker 1)
+            for seg in sentence_segments:
+                key = (seg['start'], seg['end'])
+                speaker_labels.append(speaker_map.get(key, "Speaker 1"))
+
+        # Group consecutive same-speaker segments (no merging across different speakers)
+        grouped = []
+        if speaker_labels:
+            curr = {
+                'speaker': speaker_labels[0],
+                'start': sentence_segments[0]['start'],
+                'end': sentence_segments[0]['end'],
+                'text': sentence_segments[0]['text']
             }
-            
-            for segment in temp_segments[1:]:
-                # If same speaker, merge regardless of pause duration
-                if segment['speaker'] == current_segment['speaker']:
-                    current_segment['end'] = segment['end']
-                    current_segment['text'] += ' ' + segment['text']
+            for i in range(1, len(sentence_segments)):
+                seg = sentence_segments[i]
+                spk = speaker_labels[i]
+                if spk == curr['speaker']:
+                    curr['end'] = seg['end']
+                    curr['text'] += ' ' + seg['text']
                 else:
-                    # Different speaker, start new segment
-                    final_segments.append(current_segment)
-                    current_segment = {
-                        'speaker': segment['speaker'],
-                        'start': segment['start'],
-                        'end': segment['end'],
-                        'text': segment['text']
+                    grouped.append(curr)
+                    curr = {
+                        'speaker': spk,
+                        'start': seg['start'],
+                        'end': seg['end'],
+                        'text': seg['text']
                     }
-            
-            # Don't forget the last segment
-            final_segments.append(current_segment)
-        
-        # Write to CSV
-        with open(output_csv_path, 'w', newline='', encoding='utf-8') as csvfile:
-            fieldnames = ['speaker', 'timestamp', 'End Time', 'words']
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            grouped.append(curr)
+
+        # Write CSV
+        with open(output_csv_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=['speaker', 'timestamp', 'End Time', 'words'])
             writer.writeheader()
-            
-            for segment in final_segments:
+            for seg in grouped:
                 writer.writerow({
-                    'speaker': segment['speaker'],
-                    'timestamp': f"[{format_time(segment['start'])}]",
-                    'End Time': format_end_time(segment['end']),
-                    'words': segment['text']
+                    'speaker': seg['speaker'],
+                    'timestamp': f"[{format_timestamp(seg['start'])}]",
+                    'End Time': f"[{format_timestamp(seg['end'])}]",
+                    'words': seg['text'].strip()
                 })
-        
-        logger.info(f"Created CSV: {output_csv_path}")
+
+        logger.info(f"✅ Output written to: {output_csv_path}")
         return True
-        
+
     except Exception as e:
-        logger.error(f"Error processing {input_path}: {str(e)}")
+        logger.error(f"Failed to process {input_path.name}: {e}")
         return False
     finally:
-        if os.path.exists(temp_wav_path):
-            os.unlink(temp_wav_path)
+        if os.path.exists(wav_path):
+            os.unlink(wav_path)
 
+# === MAIN ===
 
 def main():
     ensure_dir(INPUT_DIR)
     ensure_dir(OUTPUT_DIR)
-    
-    # Find supported files
-    audio_extensions = ['.wav', '.mp3', '.flac', '.aac', '.ogg', '.m4a']
-    video_extensions = ['.mp4', '.mov', '.avi', '.mkv', '.webm']
-    supported_extensions = audio_extensions + video_extensions
-    
-    input_files = []
-    for ext in supported_extensions:
-        input_files.extend(Path(INPUT_DIR).glob(f"*{ext}"))
-    
-    if not input_files:
-        logger.error(f"No supported files found in {INPUT_DIR}")
-        return
-    
-    logger.info(f"Found {len(input_files)} files to process")
-    
-    success_count = 0
-    for input_path in input_files:
-        output_csv_path = Path(OUTPUT_DIR) / f"{input_path.stem}.csv"
-        if process_file(str(input_path), str(output_csv_path)):
-            success_count += 1
-    
-    logger.info(f"Processed {success_count}/{len(input_files)} files successfully")
 
+    extensions = ['.wav', '.mp3', '.flac', '.aac', '.ogg', '.m4a', '.mp4', '.mov', '.avi', '.mkv', '.webm']
+    input_files = [f for ext in extensions for f in Path(INPUT_DIR).glob(f"*{ext}")]
+
+    if not input_files:
+        logger.error(f"No files found in {INPUT_DIR}")
+        return
+
+    logger.info(f"Processing {len(input_files)} files...")
+
+    successes = 0
+    for f in input_files:
+        output_path = Path(OUTPUT_DIR) / f"{f.stem}.csv"
+        if process_file(f, output_path):
+            successes += 1
+
+    logger.info(f"✅ Completed: {successes}/{len(input_files)} files")
 
 if __name__ == "__main__":
     main()
